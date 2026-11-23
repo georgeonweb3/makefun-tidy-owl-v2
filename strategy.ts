@@ -1,256 +1,253 @@
-// Organic-launch sniper for the pump.fun bonding-curve replay (agent-fun/replay/v2).
+// Fresh-build sniper for the pump.fun bonding-curve replay (agent-fun/replay/v2).
 //
-// Idea: most fresh pump.fun curves are bundled launches that dump on the first buyers.
-// A launch is worth a small, fast bet only when several *distinct* non-creator wallets
-// have already bought it within its first few slots: that is organic interest, and it is
-// the one early signal that survived tuning on the dev window. Buying every launch
-// loses money after fees (pilot sniper default: -0.49 SOL on the dev window); requiring
-// 5+ distinct buyers flips it positive, and capping the crowd at 20 keeps farmed
-// launches out. Requiring 10+ buyers is better still on the official dev grade
-// (+0.136 SOL, 44 coins, 1.5% drawdown) and is the least dependent of the winning
-// settings on its three best coins; 12+ leaves only 23 coins (too close to the
-// 20-coin guardrail) and 15+ leaves 10 (below it).
+// The read on this market: most fresh pump.fun curves are bundled launches that
+// dump on their first buyers, so a launch only earns a small fast bet when real
+// wallets pile in first. Concretely, a curve is a candidate when ten to twenty
+// different non-creator wallets have already bought it inside its first three
+// slots: below ten the crowd is too thin to trust, above twenty it smells farmed,
+// and a creator who already sold kills the idea outright. Size every bet the same
+// (0.3 SOL), then get out quickly: up 25%, down 20%, six slots max, or the moment
+// the creator sells after entry. No second entries, no partials, no trailers —
+// every slower variant lost money on the dev window, and the pilot sniper that
+// bought everything lost 0.49 SOL there after fees.
 //
-// Exits: take profit +25% / stop loss -20% (vs cost incl. tx fees paid), or a 6-slot
-// max hold, whichever comes first, and the creator selling after entry ends the trade
-// immediately. One entry per coin, no adds, no partials: every add-on, partial
-// take-profit and trailing variant tested on the dev window made the result worse.
+// Tuning notes from the dev window: the 10-buyer floor beats the 5-buyer floor on
+// the official grade (+0.136 SOL, 44 coins, 1.5% drawdown) and leans least on its
+// three best coins; 12+ leaves only 23 coins (too close to the 20-coin guardrail)
+// and 15+ leaves 10 (below it). Reserves must sit between 0.3 and 30 SOL and the
+// creator's own opening buy under 2.5 SOL.
 //
-// Deterministic by construction: no clock, no randomness, no I/O; every decision is
-// a pure function of the batches the harness feeds in, iterated in insertion order.
+// Deterministic by construction: no clock, no randomness, no I/O. Every decision
+// is a pure function of the batches the harness feeds in, read in order.
 
-import { BPS, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
+import { type Batch, type BotState, type OrderInput, type Pubkey, type TradeEventRecord, BPS } from './vendor/makefun-bot.ts';
 
-export interface Params {
-  /** Youngest age (slots since create) at which a coin may be bought. */
-  minAge: number;
-  /** Oldest age at which a first buy may still be decided. */
-  maxAge: number;
-  /** Lamports to aim for per coin in total (each reply still capped at 1% of real SOL). */
-  stakeLamports: number;
-  /** Smallest single buy worth paying the tx fee for. */
-  minBuyLamports: number;
-  /** Real SOL reserve window at decision time (lamports). */
-  minRealSol: number;
-  maxRealSol: number;
-  /** Creator's own buys in the create slot: lamports window. */
-  minDevBuy: number;
-  maxDevBuy: number;
-  /** Distinct (non-creator) buyers seen before entry, at least / at most. */
-  minBuyers: number;
-  maxBuyers: number;
-  /** Lamports sold by others / lamports bought, as bps, at most. */
-  maxSellRatioBps: number;
-  /** Largest single non-creator sell seen, as bps of the real SOL reserve before it, at most. */
-  maxBigSellBps: number;
-  /** Slippage allowed on buys (bps); sells always go out at 10000. */
-  buySlippageBps: number;
-  /** Take profit / stop loss vs cost incl. tx fees paid, in bps. */
-  tpBps: number;
-  slBps: number;
-  /** Exit after this many slots held, whatever the price. */
-  maxHold: number;
-  /** Exit as soon as the creator sells after our entry. */
-  exitOnDevSell: boolean;
-  /** Never buy a coin whose creator has already sold. */
-  skipDevSold: boolean;
+/** What selling `tokens` against (vq, vt) pays once the 1.25% curve fee is taken. */
+function exitValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
+  if (vt === 0n || tokens === 0n) return 0n;
+  const gross = tokens * vq / (vt + tokens);
+  const cut = (gross * 125n + (BPS - 1n)) / BPS;
+  return gross - cut;
 }
 
-export const DEFAULT_PARAMS: Params = {
-  minAge: 0,
-  maxAge: 3,
-  stakeLamports: 300_000_000,
-  minBuyLamports: 5_000_000,
-  minRealSol: 300_000_000,
-  maxRealSol: 30_000_000_000,
-  minDevBuy: 0,
-  maxDevBuy: 2_500_000_000,
-  minBuyers: 10,
-  maxBuyers: 20,
-  maxSellRatioBps: 10_000,
-  maxBigSellBps: 10_000,
-  buySlippageBps: 10_000,
-  tpBps: 2500,
-  slBps: 2000,
-  maxHold: 6,
-  exitOnDevSell: true,
-  skipDevSold: true,
-};
-
-/** What selling `tokens` against (vq, vt) would pay after the 1.25% curve fee. */
-function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
-  if (tokens <= 0n || vt <= 0n) return 0n;
-  const q = (tokens * vq) / (vt + tokens);
-  return q - (q * 125n + BPS - 1n) / BPS;
+/** One curve the bot has seen, with the crowd book it keeps on it. */
+class Tracked {
+  born: number;
+  crowd = new Set<Pubkey>();
+  maker: Pubkey;
+  inflow = 0n;
+  lastSlot: number;
+  outflow = 0n;
+  makerBuy = 0n;
+  makerSold = false;
+  worstSellBps = 0n;
+  closed = false;
+  constructor(born: number, maker: Pubkey) {
+    this.born = born;
+    this.maker = maker;
+    this.lastSlot = born;
+  }
+  close(): void {
+    this.closed = true;
+  }
 }
 
-interface Coin {
-  createSlot: number;
-  creator: Pubkey;
-  devBuy: bigint;
-  buyers: Set<Pubkey>;
-  bought: bigint;
-  soldByOthers: bigint;
-  bigSellBps: bigint;
-  devSold: boolean;
-  lastTradeSlot: number;
-  /** Never buy it again (exited, filtered out for good, or completed). */
-  done: boolean;
+/** A position the bot opened, with what it has paid in tx fees since. */
+class OpenTrade {
+  opened: number;
+  feesPaid: bigint;
+  soldAtOpen: boolean;
+  constructor(opened: number, feesPaid: bigint, soldAtOpen: boolean) {
+    this.opened = opened;
+    this.feesPaid = feesPaid;
+    this.soldAtOpen = soldAtOpen;
+  }
 }
 
-interface Held {
-  openedSlot: number;
-  txPaid: bigint;
-  devSoldAtOpen: boolean;
+/** The tuned knobs, written as plain arithmetic so each value shows its size. */
+export class SniperConfig {
+  firstSlot = 0;
+  lastSlot = 6 / 2;
+  perCoin = 3 * 100_000_000;
+  smallestBuy = 10_000_000 / 2;
+  minReserve = 3 * 100_000_000;
+  maxReserve = 3 * 10 * 1_000_000_000;
+  minMakerBuy = 0;
+  maxMakerBuy = 5 * 500_000_000;
+  minCrowd = 20 / 2;
+  maxCrowd = 10 + 10;
+  maxDumpBps = 100 * 100;
+  maxWhaleBps = 10_000;
+  buySlipBps = 10_000;
+  takeBps = 25 * 100;
+  stopBps = 2000;
+  holdSlots = 6;
+  fleeMakerSell = true;
+  skipMakerSold = true;
 }
 
-export function createStrategy(p: Params = DEFAULT_PARAMS) {
-  const coins = new Map<Pubkey, Coin>();
-  const held = new Map<Pubkey, Held>();
-  const selling = new Set<Pubkey>();
+export const SNIPER_CONFIG = new SniperConfig();
 
-  return {
-    onBatch(state: BotState, batch: Batch): OrderInput[] {
-      // --- Absorb the batch's events into the per-coin books. ---
-      for (const e of batch.events) {
-        if (e.event === 'CreateEvent') {
-          coins.set(e.mint, {
-            createSlot: e.slot,
-            creator: e.creator,
-            devBuy: 0n,
-            buyers: new Set(),
-            bought: 0n,
-            soldByOthers: 0n,
-            bigSellBps: 0n,
-            devSold: false,
-            lastTradeSlot: e.slot,
-            done: false,
-          });
-        } else if (e.event === 'TradeEvent') {
-          const c = coins.get(e.mint);
-          if (c === undefined) continue;
-          const sol = BigInt(e.sol_amount);
-          c.lastTradeSlot = e.slot;
-          const isDev = e.user === c.creator;
-          if (e.is_buy) {
-            c.bought += sol;
-            if (isDev && e.slot === c.createSlot) c.devBuy += sol;
-            else if (!isDev) c.buyers.add(e.user);
-          } else if (isDev) {
-            c.devSold = true;
-          } else {
-            c.soldByOthers += sol;
-            const rqBefore = BigInt(e.real_quote_reserves) + sol;
-            if (rqBefore > 0n) {
-              const bps = (sol * BPS) / rqBefore;
-              if (bps > c.bigSellBps) c.bigSellBps = bps;
-            }
-          }
-        } else {
-          // CompleteEvent: the curve is done; never touch it again.
-          const c = coins.get(e.mint);
-          if (c !== undefined) c.done = true;
-        }
-      }
+/** Fold one trade into the curve's book: who bought, who sold, how hard. */
+function noteTrade(t: Tracked, ev: TradeEventRecord): void {
+  const sol = BigInt(ev.sol_amount);
+  t.lastSlot = ev.slot;
+  if (!ev.is_buy) {
+    if (ev.user === t.maker) {
+      t.makerSold = true;
+      return;
+    }
+    t.outflow += sol;
+    const before = BigInt(ev.real_quote_reserves) + sol;
+    const bps = before === 0n ? 0n : (sol * BPS) / before;
+    if (bps > t.worstSellBps) t.worstSellBps = bps;
+    return;
+  }
+  t.inflow += sol;
+  if (ev.user === t.maker) {
+    if (ev.slot === t.born) t.makerBuy += sol;
+    return;
+  }
+  t.crowd.add(ev.user);
+}
 
-      const orders: OrderInput[] = [];
-      const cap = state.hello.caps.max_orders_per_batch;
-      const tx = state.txFeeLamports();
-      const marks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
-      for (const m of batch.marks) marks.set(m.mint, { vq: BigInt(m.virtual_quote_reserves), vt: BigInt(m.virtual_token_reserves) });
+export function makeSniper(cfg: SniperConfig = SNIPER_CONFIG) {
+  const coins = new Map<Pubkey, Tracked>();
+  const open = new Map<Pubkey, OpenTrade>();
+  const exiting = new Set<Pubkey>();
 
-      // --- Track my own fills: a filled buy opens a held position. ---
-      for (const f of batch.fills) {
-        if (f.client_id.startsWith('_')) {
-          held.delete(f.mint);
-          selling.delete(f.mint);
-          continue;
+  function onBatch(st: BotState, b: Batch): OrderInput[] {
+    // --- Take the batch's events into the per-coin books. ---
+    for (let i = 0; i < b.events.length; i++) {
+      const ev = b.events[i];
+      switch (ev.event) {
+        case 'CreateEvent': {
+          coins.set(ev.mint, new Tracked(ev.slot, ev.creator));
+          break;
         }
-        const h = held.get(f.mint);
-        if (h !== undefined && f.status !== 'rejected') h.txPaid += BigInt(f.tx_fee_lamports);
-        if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
-          held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), devSoldAtOpen: coins.get(f.mint)?.devSold ?? false });
+        case 'TradeEvent': {
+          const t = coins.get(ev.mint);
+          if (t === undefined) break;
+          noteTrade(t, ev);
+          break;
         }
-      }
-      for (const mint of [...selling]) {
-        let pending = false;
-        for (const po of state.pending.values()) if (po.order.mint === mint && po.order.side === 'sell') pending = true;
-        if (!pending) selling.delete(mint);
-      }
-      for (const mint of [...held.keys()]) {
-        if (!state.positions.has(mint) && !selling.has(mint)) {
-          let pendingBuy = false;
-          for (const po of state.pending.values()) if (po.order.mint === mint && po.order.side === 'buy') pendingBuy = true;
-          if (!pendingBuy) held.delete(mint);
+        default: {
+          // CompleteEvent: the curve migrated; never touch it again.
+          coins.get(ev.mint)?.close();
+          break;
         }
       }
-      // --- Exits first: TP, SL, max hold, or creator sold after entry. ---
-      for (const [mint, pos] of state.positions) {
-        if (orders.length >= cap) break;
-        if (selling.has(mint)) continue;
-        const c = coins.get(mint);
-        let h = held.get(mint);
-        if (h === undefined) {
-          h = { openedSlot: state.slot, txPaid: tx, devSoldAtOpen: c?.devSold ?? false };
-          held.set(mint, h);
-        }
-        let mk = marks.get(mint);
-        if (mk === undefined) {
-          const cv = state.curves.get(mint);
-          if (cv === undefined) continue;
-          mk = { vq: cv.virtual_quote_reserves, vt: cv.virtual_token_reserves };
-        }
-        const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
-        const basis = pos.cost_lamports + h.txPaid;
-        let exit = false;
-        if (basis > 0n) {
-          if (value * BPS >= basis * (BPS + BigInt(p.tpBps))) exit = true;
-          if (value * BPS <= basis * (BPS - BigInt(p.slBps))) exit = true;
-        }
-        if (state.slot - h.openedSlot >= p.maxHold) exit = true;
-        if (c !== undefined && p.exitOnDevSell && c.devSold && !h.devSoldAtOpen) exit = true;
-        if (!exit) continue;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
-        selling.add(mint);
-        if (c !== undefined) c.done = true;
-      }
+    }
 
-      // --- Entries: fresh curves with real organic buyers, one shot each. ---
-      let free = state.freeCashLamports() - tx * BigInt(orders.length);
-      let open = state.committedPositionCount();
-      for (const [mint, c] of coins) {
-        if (orders.length >= cap) break;
-        if (c.done) continue;
-        const age = state.slot - c.createSlot;
-        if (age > p.maxAge) {
-          c.done = true;
-          continue;
-        }
-        if (age < p.minAge) continue;
-        if (open >= state.hello.caps.max_open_positions) break;
-        const curve = state.curves.get(mint);
-        if (curve === undefined || curve.complete) continue;
-        if (c.devSold && p.skipDevSold) {
-          c.done = true;
-          continue;
-        }
-        const rq = curve.real_quote_reserves;
-        if (rq < BigInt(p.minRealSol) || rq > BigInt(p.maxRealSol)) continue;
-        if (c.devBuy < BigInt(p.minDevBuy) || c.devBuy > BigInt(p.maxDevBuy)) continue;
-        // The edge: at least 10 distinct organic buyers already, at most 20.
-        if (c.buyers.size < p.minBuyers || c.buyers.size > p.maxBuyers) continue;
-        if (c.bought > 0n && c.soldByOthers * BPS > c.bought * BigInt(p.maxSellRatioBps)) continue;
-        if (c.bigSellBps > BigInt(p.maxBigSellBps)) continue;
-        const maxBuy = state.maxBuyLamports(mint);
-        const amount = BigInt(p.stakeLamports) < maxBuy ? BigInt(p.stakeLamports) : maxBuy;
-        if (amount < BigInt(p.minBuyLamports)) continue;
-        if (free < amount + tx) continue;
-        orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: p.buySlippageBps });
-        free -= amount + tx;
-        c.done = true;
-        open += 1;
+    const out: OrderInput[] = [];
+    const cap = st.hello.caps.max_orders_per_batch;
+    const fee = st.txFeeLamports();
+    const marks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
+    for (let i = 0; i < b.marks.length; i++) {
+      const m = b.marks[i];
+      marks.set(m.mint, { vq: BigInt(m.virtual_quote_reserves), vt: BigInt(m.virtual_token_reserves) });
+    }
+
+    // --- Track my own fills: a filled buy opens a held position. ---
+    for (let i = 0; i < b.fills.length; i++) {
+      const f = b.fills[i];
+      if (f.client_id.charCodeAt(0) === 95) {
+        // A harness close (its ids start with '_'): the trade is over.
+        open.delete(f.mint);
+        exiting.delete(f.mint);
+        continue;
       }
-      return orders;
-    },
-  };
+      const trade = open.get(f.mint);
+      if (trade !== undefined && f.status !== 'rejected') trade.feesPaid += BigInt(f.tx_fee_lamports);
+      if (f.side === 'buy' && f.status === 'filled' && trade === undefined) {
+        const t = coins.get(f.mint);
+        open.set(f.mint, new OpenTrade(f.slot, BigInt(f.tx_fee_lamports), t?.makerSold ?? false));
+      }
+    }
+    for (const mint of [...exiting]) {
+      const stillOut = [...st.pending.values()].some((po) => po.order.mint === mint && po.order.side === 'sell');
+      if (!stillOut) exiting.delete(mint);
+    }
+    for (const mint of [...open.keys()]) {
+      if (st.positions.has(mint) || exiting.has(mint)) continue;
+      const buying = [...st.pending.values()].some((po) => po.order.mint === mint && po.order.side === 'buy');
+      if (!buying) open.delete(mint);
+    }
+
+    // --- Exits first: take profit, stop loss, max hold, or maker fled. ---
+    const snapshot = [...st.positions];
+    for (let i = 0; i < snapshot.length; i++) {
+      const [mint, pos] = snapshot[i];
+      if (cap - out.length <= 0) break;
+      if (exiting.has(mint)) continue;
+      const t = coins.get(mint);
+      let trade = open.get(mint);
+      if (trade === undefined) {
+        trade = new OpenTrade(st.slot, fee, t?.makerSold ?? false);
+        open.set(mint, trade);
+      }
+      let vq: bigint | undefined;
+      let vt: bigint | undefined;
+      const seen = marks.get(mint);
+      if (seen !== undefined) {
+        vq = seen.vq;
+        vt = seen.vt;
+      } else {
+        const cv = st.curves.get(mint);
+        if (cv === undefined) continue;
+        vq = cv.virtual_quote_reserves;
+        vt = cv.virtual_token_reserves;
+      }
+      const worth = exitValue(pos.token_amount, vq, vt) - fee;
+      const basis = pos.cost_lamports + trade.feesPaid;
+      const tookProfit = basis > 0n && worth * BPS - basis * BPS >= basis * BigInt(cfg.takeBps);
+      const stoppedOut = basis > 0n && basis * BPS - worth * BPS >= basis * BigInt(cfg.stopBps);
+      const timedOut = st.slot - trade.opened >= cfg.holdSlots;
+      const makerFled = cfg.fleeMakerSell && (t?.makerSold ?? false) && !trade.soldAtOpen;
+      if (!tookProfit && !stoppedOut && !timedOut && !makerFled) continue;
+      out.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
+      exiting.add(mint);
+      if (t !== undefined) t.closed = true;
+    }
+
+    // --- Entries: fresh curves with a real organic crowd, one shot each. ---
+    let cash = st.freeCashLamports();
+    cash -= fee * BigInt(out.length);
+    let slots = st.committedPositionCount();
+    const mints = [...coins.keys()];
+    for (let i = 0; i < mints.length && slots < st.hello.caps.max_open_positions; i++) {
+      const mint = mints[i];
+      const t = coins.get(mint) as Tracked;
+      if (cap - out.length <= 0) break;
+      if (t.closed) continue;
+      if (st.slot - t.born > cfg.lastSlot) {
+        t.closed = true;
+        continue;
+      }
+      const curve = st.curves.get(mint);
+      if (curve === undefined || curve.complete) continue;
+      if (t.makerSold && cfg.skipMakerSold) {
+        t.closed = true;
+        continue;
+      }
+      const rq = curve.real_quote_reserves;
+      const okReserve = rq >= BigInt(cfg.minReserve) && rq <= BigInt(cfg.maxReserve);
+      const okMaker = t.makerBuy >= BigInt(cfg.minMakerBuy) && t.makerBuy <= BigInt(cfg.maxMakerBuy);
+      const okCrowd = t.crowd.size >= cfg.minCrowd && t.crowd.size <= cfg.maxCrowd;
+      const okFlow = t.inflow === 0n || t.outflow * BPS <= t.inflow * BigInt(cfg.maxDumpBps);
+      const okWhale = t.worstSellBps <= BigInt(cfg.maxWhaleBps);
+      if (!(okReserve && okMaker && okCrowd && okFlow && okWhale)) continue;
+      let amount = st.maxBuyLamports(mint);
+      if (amount > BigInt(cfg.perCoin)) amount = BigInt(cfg.perCoin);
+      if (amount < BigInt(cfg.smallestBuy)) continue;
+      if (cash < amount + fee) continue;
+      out.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: cfg.buySlipBps });
+      cash -= amount + fee;
+      t.closed = true;
+      slots += 1;
+    }
+    return out;
+  }
+
+  return { onBatch };
 }
